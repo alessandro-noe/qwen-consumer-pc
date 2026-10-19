@@ -1,0 +1,536 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index ab82e3d6c..a14233d62 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1652,6 +1652,10 @@ static void ggml_compute_forward_mul_mat_id(
+             for (int id = 0; id < n_ids; ++id) {
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+ 
++                if (i02 < 0) { // agente-locale: esperto saltato (calcolato altrove), uscita a zero
++                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
++                    continue;
++                }
+                 assert(i02 >= 0 && i02 < n_as);
+ 
+                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 2632ae3a0..975bef968 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4855,6 +4855,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                     const int32_t i02 =
+                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+ 
++                    if (i02 < 0) { // agente-locale: esperto saltato, uscita a zero
++                        memset((char *) dst->data + id * dst->nb[1] + iid1 * dst->nb[2], 0, dst->ne[0] * sizeof(float));
++                        continue;
++                    }
+                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
+ 
+                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b566..937e7052a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,5 +1,8 @@
+ #include "llama-context.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ #include "ggml.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+@@ -1829,6 +1832,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         return -1;
+     }
+ 
++    // agente-locale: MOE_ESEC_K. L'ultimo marcatore visto decide la fase: </think> -> esecuzione (K esperti),
++    // <think> -> ragionamento (tutti). Vale sia per il prompt (ragionamento spento: finisce con </think>)
++    // sia per i token generati uno alla volta.
++    {
++        static int esec_k = [] { const char * e = getenv("MOE_ESEC_K"); return e ? atoi(e) : 0; }();
++        // MOE_ESEC_FILE: un file con il K da usare, riletto a ogni nuovo prompt (lotto di piu' token, mai mentre
++        // genera): lo scrive lo smistatore (scalata: K veloce finche' i test passano, 0 = tutti dopo un errore)
++        static const char * esec_file = getenv("MOE_ESEC_FILE");
++        if (esec_file && batch_inp.tokens.size() > 1) {
++            if (FILE * f = fopen(esec_file, "r")) {
++                int k = 0;
++                if (fscanf(f, "%d", &k) == 1) { esec_k = k; }
++                fclose(f);
++            }
++            if (esec_k == 0) { llama_moe_fase_k_set(0); }
++        }
++        if (esec_k > 0 && model.vocab.get_type() != LLAMA_VOCAB_TYPE_NONE) {
++            static const llama_token t_ini = model.vocab.text_to_token("<think>");
++            static const llama_token t_fin = model.vocab.text_to_token("</think>");
++            for (const auto & t : batch_inp.tokens) {
++                if (t.id == t_ini && t_ini != LLAMA_TOKEN_NULL) { llama_moe_fase_k_set(0); }
++                if (t.id == t_fin && t_fin != LLAMA_TOKEN_NULL) { llama_moe_fase_k_set(esec_k); }
++            }
++        }
++    }
++
+     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
+         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
+                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
+@@ -2706,6 +2735,7 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.moe_fase_k  =*/ llama_moe_fase_k_get(),
+     };
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6cadda971..ed5513ca6 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,5 +1,7 @@
+ #include "llama-graph.h"
+ 
++#include <cstdlib>
++
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -24,6 +26,12 @@
+ #include <sstream>
+ #include <string>
+ #include <unordered_set>
++#include <atomic>
++
++// agente-locale: fase corrente per MOE_ESEC_K (0 = tutti gli esperti)
++static std::atomic<int> g_moe_fase_k{0};
++int  llama_moe_fase_k_get()      { return g_moe_fase_k.load(std::memory_order_relaxed); }
++void llama_moe_fase_k_set(int k) { g_moe_fase_k.store(k, std::memory_order_relaxed); }
+ 
+ // dedup helpers
+ 
+@@ -2282,10 +2290,66 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // agente-locale: MoE IBRIDO (MOE_HYBRID=1). Gli esperti fissi per impatto stanno nella GPU, gli altri li
++    // calcola la CPU dalla RAM: niente trasferimento di esperti. Solo per lotti piccoli (generazione).
++    const bool moe_hybrid = moe_cache != nullptr && moe_cache->hybrid(il) && gate_up_exps == nullptr &&
++        !weight_before_ffn && n_tokens <= 32 && up_exps != nullptr && down_exps != nullptr &&
++        moe_cache->get_experts(up_exps) != nullptr && moe_cache->get_experts(down_exps) != nullptr &&
++        (gate_exps == nullptr || moe_cache->get_experts(gate_exps) != nullptr);
++
++    // agente-locale: MOE_CPU_TOPK, meno esperti sui piani in RAM (solo generazione)
++    {
++        static const int cpu_topk_env = [] { const char * e = getenv("MOE_CPU_TOPK"); return e ? atoi(e) : 0; }();
++        // agente-locale: MOE_ESEC_K, lo stesso taglio ma solo nella fase di esecuzione (dopo </think>) e solo
++        // generando un token alla volta: piano e ragionamento restano con tutti gli esperti
++        const int cpu_topk = cpu_topk_env > 0 ? cpu_topk_env : (n_tokens == 1 ? llama_moe_fase_k_get() : 0);
++        const bool host_layer = up_exps != nullptr && up_exps->buffer != nullptr &&
++            ggml_backend_buffer_is_host(up_exps->buffer);
++        if (!moe_hybrid && cpu_topk > 0 && cpu_topk < n_expert_used && host_layer && n_tokens <= 32 &&
++            gate_up_exps == nullptr && !weight_before_ffn) {
++            selected_experts = ggml_cont(ctx0, ggml_view_2d(ctx0, selected_experts, cpu_topk, n_tokens,
++                selected_experts->nb[1], 0));
++            weights = ggml_cont(ctx0, ggml_view_3d(ctx0, weights, 1, cpu_topk, n_tokens,
++                weights->nb[1], weights->nb[2], 0));
++        }
++
++        // agente-locale: taglio CONDIZIONATO alla sicurezza del router (solo lotti < 32: restano sulla CPU)
++        static const int   conf_k   = [] { const char * e = getenv("MOE_CONF_K");   return e ? atoi(e) : 0; }();
++        static const float conf_tau = [] { const char * e = getenv("MOE_CONF_TAU"); return e ? (float) atof(e) : 0.9f; }();
++        if (!moe_hybrid && cpu_topk == 0 && conf_k > 0 && conf_k < n_expert_used && host_layer && n_tokens < 32 &&
++            gate_up_exps == nullptr && !weight_before_ffn) {
++            const int64_t nt = n_expert_used - conf_k;
++            ggml_tensor * w2    = ggml_cont(ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, weights), n_expert_used, n_tokens));
++            ggml_tensor * w_h   = ggml_view_2d(ctx0, w2, conf_k, n_tokens, w2->nb[1], 0);
++            ggml_tensor * w_t   = ggml_view_2d(ctx0, w2, nt, n_tokens, w2->nb[1], conf_k*ggml_element_size(w2));
++            ggml_tensor * head  = ggml_sum_rows(ctx0, w_h);                        // [1, n_tokens]
++            ggml_tensor * total = ggml_sum_rows(ctx0, w2);                         // [1, n_tokens]
++            ggml_tensor * sure  = ggml_step(ctx0, ggml_sub(ctx0, head, ggml_scale(ctx0, total, conf_tau))); // 1 = sicuro
++            ggml_tensor * sure_t = ggml_repeat(ctx0, sure, ggml_cont(ctx0, w_t));  // [nt, n_tokens]
++
++            ggml_tensor * ids_f = ggml_cast(ctx0, ggml_cont(ctx0, selected_experts), GGML_TYPE_F32);
++            ggml_tensor * id_h  = ggml_view_2d(ctx0, ids_f, conf_k, n_tokens, ids_f->nb[1], 0);
++            ggml_tensor * id_t  = ggml_cont(ctx0, ggml_view_2d(ctx0, ids_f, nt, n_tokens, ids_f->nb[1], conf_k*ggml_element_size(ids_f)));
++            // coda: id se incerto, -1 se sicuro  ->  id - sure*id - sure
++            ggml_tensor * id_t2 = ggml_sub(ctx0, ggml_sub(ctx0, id_t, ggml_mul(ctx0, id_t, sure_t)), sure_t);
++            ggml_tensor * w_t2  = ggml_sub(ctx0, ggml_cont(ctx0, w_t), ggml_mul(ctx0, ggml_cont(ctx0, w_t), sure_t));
++
++            selected_experts = ggml_cast(ctx0, ggml_concat(ctx0, ggml_cont(ctx0, id_h), id_t2, 0), GGML_TYPE_I32);
++            weights = ggml_reshape_3d(ctx0, ggml_concat(ctx0, ggml_cont(ctx0, w_h), w_t2, 0), 1, n_expert_used, n_tokens);
++            cb(selected_experts, "ffn_moe_conf_ids", il);
++        }
++    }
++
+     // the experts of host-resident layers may be read from the MoE cache
+-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
++    ggml_tensor * slots = moe_hybrid ? nullptr :
++        build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
++    ggml_tensor * const cur_moe_in = cur;
++
++    // calcolo degli esperti per (id, posti in cache, pesi): una volta normale, due volte nel MoE ibrido
++    auto run_experts = [&](ggml_tensor * selected_experts, ggml_tensor * slots, ggml_tensor * weights) -> ggml_tensor * {
++    ggml_tensor * cur = cur_moe_in;
+ 
+     if (weight_before_ffn) {
+         // repeat cur to [n_embd, n_expert_used, n_tokens]
+@@ -2463,7 +2527,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // Use per-layer n_expert_used to bound the graph even during warmup (avoids
+     // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
+     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
+-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
++    const uint32_t n_expert_used_il = std::min<uint32_t>(hparams.n_expert_used(il), (uint32_t) experts->ne[1]);
+     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+ 
+@@ -2483,6 +2547,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // avoid returning a non-contiguous tensor
+         moe_out = ggml_cont(ctx0, moe_out);
+     }
++    return moe_out;
++    };
++
++    ggml_tensor * moe_out = nullptr;
++    if (!moe_hybrid) {
++        moe_out = run_experts(selected_experts, slots, weights);
++    } else {
++        ggml_tensor * ids = selected_experts;
++        if (!ggml_is_contiguous(ids)) {
++            ids = ggml_cont(ctx0, ids);
++        }
++        ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
++        ggml_tensor * hot_slots = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->hybrid_table(il, 0), ids), n_expert_used, n_tokens);
++        ggml_tensor * hot_mask  = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, moe_cache->hybrid_table(il, 1), ids), 1, n_expert_used, n_tokens);
++        ggml_tensor * cold_ids  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->hybrid_table(il, 2), ids), n_expert_used, n_tokens);
++        cb(hot_slots, "ffn_moe_hybrid_slots", il);
++        cb(cold_ids,  "ffn_moe_hybrid_cold", il);
++
++        ggml_tensor * w_hot  = ggml_mul(ctx0, weights, hot_mask);
++        ggml_tensor * w_cold = ggml_sub(ctx0, weights, w_hot);
++
++        ggml_tensor * out_hot  = run_experts(selected_experts, hot_slots, w_hot); // GPU, esperti fissi
++        static const int cold_topk = [] { const char * e = getenv("MOE_COLD_TOPK"); return e ? atoi(e) : 0; }();
++        if (cold_topk > 0 && cold_topk < n_expert_used) {
++            // agente-locale: salta i freddi deboli, la CPU guarda solo le prime cold_topk scelte del router
++            cold_ids = ggml_cont(ctx0, ggml_view_2d(ctx0, cold_ids, cold_topk, n_tokens, cold_ids->nb[1], 0));
++            w_cold   = ggml_cont(ctx0, ggml_view_3d(ctx0, w_cold, 1, cold_topk, n_tokens, w_cold->nb[1], w_cold->nb[2], 0));
++        }
++        static const char * only = getenv("MOE_HYBRID_ONLY"); // agente-locale: solo diagnosi dei tempi
++        if (only && strcmp(only, "hot") == 0) {
++            moe_out = out_hot;
++        } else if (only && strcmp(only, "none") == 0) {
++            moe_out = ggml_scale(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, cur_moe_in, n_embd, n_tokens, cur_moe_in->nb[2], 0)), 0.0f);
++        } else {
++            ggml_tensor * out_cold = run_experts(cold_ids, nullptr, w_cold);      // CPU, -1 = saltato
++            moe_out = (only && strcmp(only, "cold") == 0) ? out_cold : ggml_add(ctx0, out_hot, out_cold);
++        }
++    }
+ 
+     cb(moe_out, "ffn_moe_out", il);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index e853a0269..41d08a940 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -99,6 +99,11 @@ struct llama_cross {
+ 
+ struct llm_graph_params;
+ 
++// agente-locale: esperti per FASE (MOE_ESEC_K). Durante il ragionamento tutti gli esperti; dopo </think>
++// (fase di esecuzione) solo i primi K sui piani in RAM. La fase la aggiorna llama_context::decode.
++int  llama_moe_fase_k_get();
++void llama_moe_fase_k_set(int k);
++
+ //
+ // llm_graph_input
+ //
+@@ -829,6 +834,8 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    int moe_fase_k = 0; // agente-locale: K della fase al momento della costruzione (0 = tutti gli esperti)
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
+@@ -869,6 +876,10 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        if (moe_fase_k != other.moe_fase_k) {
++            return false;
++        }
++
+         if (!samplers_equal(samplers, other.samplers)) {
+             return false;
+         }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f22d986dc..519b5589e 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -6,6 +6,8 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <vector>
+@@ -30,6 +32,22 @@ struct moe_cache_lru {
+     uint32_t seen_gen = 0;
+     std::vector<int32_t> uniq;
+ 
++    // agente-locale: esperti FISSI (scelti per impatto). Un esperto fisso, una volta caricato,
++    // esce dalla lista LRU e non viene piu' sostituito. pinned[il*n_expert + e] = 1 se fisso.
++    std::vector<uint8_t> pinned;
++    std::vector<uint8_t> slot_pinned; // [n_slots]
++    int32_t n_in_list = 0;
++    int32_t min_in_list = 0;          // slot che devono restare nella LRU (posto per gli esperti non fissi)
++
++    // toglie lo slot s dalla lista LRU (diventa fisso)
++    void unlink(int32_t s) {
++        if (prev[s] >= 0) { next[prev[s]] = next[s]; } else { head = next[s]; }
++        if (next[s] >= 0) { prev[next[s]] = prev[s]; } else { tail = prev[s]; }
++        prev[s] = next[s] = -1;
++        slot_pinned[s] = 1;
++        n_in_list--;
++    }
++
+     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+         this->n_expert = n_expert;
+         this->n_slots  = n_slots;
+@@ -44,10 +62,16 @@ struct moe_cache_lru {
+         head = 0;
+         tail = n_slots - 1;
+         seen.assign(n_expert, 0);
++        pinned.assign((size_t) n_layer*n_expert, 0);
++        slot_pinned.assign(n_slots, 0);
++        n_in_list = n_slots;
+     }
+ 
+     // move slot s to the tail (most recently used)
+     void touch(int32_t s) {
++        if (slot_pinned[s]) {
++            return;
++        }
+         if (s == tail) {
+             return;
+         }
+@@ -114,6 +138,9 @@ struct moe_cache_lru {
+             slots[e] = s;
+             touch(s);
+             fills.push_back({ e, s });
++            if (pinned[(size_t) il*n_expert + e] && n_in_list > min_in_list) {
++                unlink(s);
++            }
+         }
+         return true;
+     }
+@@ -178,6 +205,8 @@ struct llama_moe_cache::impl {
+     struct layer {
+         int32_t ig = -1;                    // -1 if the layer is not cached
+         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
++        ggml_tensor * hy[3] = { nullptr, nullptr, nullptr }; // agente-locale: tabelle del MoE ibrido
++        bool hybrid = false;
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+     };
+ 
+@@ -196,6 +225,7 @@ struct llama_moe_cache::impl {
+     static constexpr int64_t max_batch = 32;
+ 
+     int32_t n_expert_used;
++    bool hybrid_on = false; // agente-locale: MOE_HYBRID=1
+ 
+     stats stats_small; // up to 8 tokens per ubatch
+     stats stats_large;
+@@ -220,6 +250,11 @@ struct llama_moe_cache::impl {
+ 
+     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++        {
++            const char * hy = getenv("MOE_HYBRID");
++            const char * pin = getenv("MOE_CACHE_PIN");
++            hybrid_on = hy && *hy == '1' && pin && *pin;
++        }
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+@@ -324,6 +359,7 @@ struct llama_moe_cache::impl {
+                 continue;
+             }
+             g.lru.init(model.layers.size(), n_expert, g.n_slots);
++            load_pins(g, n_expert);
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+             n_tensors_host  += g.layers.size();
+         }
+@@ -348,7 +384,7 @@ struct llama_moe_cache::impl {
+                 devices[id].ctx = init_ctx(n_tensors[id]);
+             }
+         }
+-        ctx_host  = init_ctx(n_tensors_host);
++        ctx_host  = init_ctx(4*n_tensors_host);
+         ctx_views = init_ctx(2);
+ 
+         ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+@@ -380,6 +416,13 @@ struct llama_moe_cache::impl {
+                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
+                 layer_of[l.slot_map] = il;
+                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
++                if (hybrid_on) {
++                    const ggml_type tt[3] = { GGML_TYPE_I32, GGML_TYPE_F32, GGML_TYPE_I32 };
++                    for (int k = 0; k < 3; ++k) {
++                        l.hy[k] = ggml_new_tensor_2d(ctx_host.get(), tt[k], 1, g.ref[0]->ne[2]);
++                        ggml_format_name(l.hy[k], "moe_hybrid.%d-%d", k, il);
++                    }
++                }
+             }
+             devices[g.id].buf_size += alloc_size(g, g.n_slots);
+         }
+@@ -425,6 +468,9 @@ struct llama_moe_cache::impl {
+                     }
+                 }
+             }
++            if (hybrid_on) {
++                init_hybrid();
++            }
+         }
+ 
+         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
+@@ -451,6 +497,81 @@ struct llama_moe_cache::impl {
+         }
+     }
+ 
++    // agente-locale: MOE_CACHE_PIN=<file> righe "piano esperto", per ogni piano in ordine di impatto decrescente.
++    // MOE_CACHE_PIN_FRAC (default 0.85) = quota degli slot del gruppo riservata agli esperti fissi.
++    void load_pins(group & g, int32_t n_expert) {
++        const char * path = getenv("MOE_CACHE_PIN");
++        if (path == nullptr || *path == 0) {
++            return;
++        }
++        FILE * f = fopen(path, "r");
++        if (f == nullptr) {
++            LLAMA_LOG_WARN("%s: cannot open MOE_CACHE_PIN file %s\n", __func__, path);
++            return;
++        }
++        const char * fr = getenv("MOE_CACHE_PIN_FRAC");
++        const double frac = fr ? atof(fr) : 0.85;
++        const int32_t k = (int32_t) (frac*g.n_slots/g.layers.size());
++        g.lru.min_in_list = std::max<int32_t>(g.n_slots - k*(int32_t) g.layers.size(), (int32_t) (n_expert_used*max_batch));
++        std::vector<int32_t> count(layers.size(), 0);
++        std::vector<uint8_t> in_group(layers.size(), 0);
++        for (int32_t il : g.layers) {
++            in_group[il] = 1;
++        }
++        int32_t il, e, n = 0;
++        while (fscanf(f, "%d %d", &il, &e) == 2) {
++            if (il >= 0 && il < (int32_t) layers.size() && in_group[il] && e >= 0 && e < n_expert && count[il] < k) {
++                g.lru.pinned[(size_t) il*n_expert + e] = 1;
++                count[il]++;
++                n++;
++            }
++        }
++        fclose(f);
++        LLAMA_LOG_INFO("%s: agente-locale: %d esperti fissi per impatto (%d per piano, %d slot restano LRU)\n",
++            __func__, n, k, g.lru.min_in_list);
++    }
++
++    size_t n_copy_calls = 0;
++
++    // agente-locale: ogni esperto fisso riceve un posto fisso nella GPU e viene caricato UNA volta.
++    void init_hybrid() {
++        size_t n_up = 0, bytes = 0;
++        for (group & g : groups) {
++            if (g.n_slots == 0) {
++                continue;
++            }
++            const int32_t n_expert = g.ref[0]->ne[2];
++            int32_t s = 0;
++            for (int32_t il : g.layers) {
++                layer & l = layers[il];
++                if (l.hy[0] == nullptr) {
++                    continue;
++                }
++                int32_t * hot_slot = (int32_t *) l.hy[0]->data;
++                float   * hot_mask = (float   *) l.hy[1]->data;
++                int32_t * cold_id  = (int32_t *) l.hy[2]->data;
++                int32_t n_hot = 0;
++                for (int32_t e = 0; e < n_expert; ++e) {
++                    const bool hot = g.lru.pinned[(size_t) il*n_expert + e] && s < g.n_slots;
++                    hot_slot[e] = hot ? s : 0;
++                    hot_mask[e] = hot ? 1.0f : 0.0f;
++                    cold_id[e]  = hot ? -1 : e;
++                    if (hot) {
++                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                            const ggml_tensor * w = l.experts[ip];
++                            ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + e*w->nb[2], s*w->nb[2], w->nb[2]);
++                            bytes += w->nb[2];
++                        }
++                        s++; n_hot++; n_up++;
++                    }
++                }
++                l.hybrid = n_hot > 0;
++            }
++        }
++        LLAMA_LOG_INFO("%s: agente-locale: MoE IBRIDO attivo, %zu esperti fissi caricati una volta in GPU (%.1f MiB)\n",
++            __func__, n_up, bytes/1024.0/1024.0);
++    }
++
+     ggml_backend_t backend(int32_t il) const {
+         return devices[groups[layers[il].ig].id].backend;
+     }
+@@ -472,6 +593,14 @@ struct llama_moe_cache::impl {
+         return l.slot_map;
+     }
+ 
++    bool hybrid(int32_t il) const {
++        return il >= 0 && il < (int32_t) layers.size() && layers[il].hybrid;
++    }
++
++    ggml_tensor * hybrid_table(int32_t il, int which) const {
++        return hybrid(il) ? layers[il].hy[which] : nullptr;
++    }
++
+     ggml_tensor * get_experts(const ggml_tensor * w) const {
+         const auto it = bindings.find(w);
+         return it != bindings.end() ? it->second.cached : nullptr;
+@@ -575,6 +704,9 @@ struct llama_moe_cache::impl {
+         st.hits   += n_hit;
+         st.misses += fills.size();
+         st.bytes  += bytes;
++        if (++n_copy_calls % 20000 == 0) {
++            log_stats();
++        }
+ 
+         // the next copy synchronizes the backend before it changes the slot map again
+         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+@@ -637,3 +769,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
+     }
+     return res;
+ }
++
++bool llama_moe_cache::hybrid(int32_t il) const {
++    return pimpl->hybrid(il);
++}
++
++ggml_tensor * llama_moe_cache::hybrid_table(int32_t il, int which) const {
++    return pimpl->hybrid_table(il, which);
++}
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 3b6726b86..bbe239485 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -34,6 +34,12 @@ public:
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
++    // agente-locale: MoE ibrido. true se il piano il usa gli esperti fissi in GPU + gli altri sulla CPU
++    bool hybrid(int32_t il) const;
++    // tabelle [1, n_expert] del piano il: 0 = posto in GPU (I32, 0 se freddo), 1 = maschera caldo (F32 1/0),
++    // 2 = id per la CPU (I32, -1 se caldo)
++    ggml_tensor * hybrid_table(int32_t il, int which) const;
++
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;

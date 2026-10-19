@@ -1,0 +1,10 @@
+<!doctype html><meta charset="utf-8"><title>Prodotti</title><script src="comune.js"></script>
+<body><script>nav()</script><h1>Prodotti</h1>
+<input id="q" placeholder="Cerca prodotti" aria-label="Cerca prodotti"> <button onclick="S.set('ricerca',document.getElementById('q').value)">Cerca</button>
+<label>Ordina per <select aria-label="Ordina per" onchange="S.set('ordine',this.value)"><option value="rilevanza">Rilevanza</option><option value="prezzo_su">Prezzo crescente</option><option value="prezzo_giu">Prezzo decrescente</option></select></label>
+<p id="msg"></p>
+<div>Tastiera meccanica 59 euro <button onclick="aggiungi('tastiera')" aria-label="Aggiungi tastiera al carrello">Aggiungi al carrello</button> <a href="#">Dettagli tastiera</a></div>
+<div>Mouse wireless 25 euro <button onclick="aggiungi('mouse')" aria-label="Aggiungi mouse al carrello">Aggiungi al carrello</button> <a href="#">Dettagli mouse</a></div>
+<div>Cuffie bluetooth 79 euro <button onclick="aggiungi('cuffie')" aria-label="Aggiungi cuffie al carrello">Aggiungi al carrello</button> <a href="#">Dettagli cuffie</a></div>
+<div>Monitor 27 pollici 219 euro <button onclick="aggiungi('monitor')" aria-label="Aggiungi monitor al carrello">Aggiungi al carrello</button> <a href="#">Dettagli monitor</a></div>
+<button>Confronta</button> <button>Lista desideri</button></body>

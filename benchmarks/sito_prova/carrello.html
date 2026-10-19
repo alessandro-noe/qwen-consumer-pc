@@ -1,0 +1,8 @@
+<!doctype html><meta charset="utf-8"><title>Carrello</title><script src="comune.js"></script>
+<body><script>nav()</script><h1>Carrello</h1><div id="lista"></div>
+<a href="pagamento.html">Procedi al pagamento</a> <button>Applica codice sconto</button>
+<script>
+const c = S.get('carrello') || [];
+document.getElementById('lista').innerHTML = c.map((p, i) => `<div>${p} <button aria-label="Rimuovi ${p}" onclick="const c=S.get('carrello');c.splice(${i},1);S.set('carrello',c);location.reload()">Rimuovi</button></div>`).join('') || 'Carrello vuoto';
+S.set('visto_carrello', true);
+</script></body>

@@ -1,0 +1,30 @@
+# model weights and engine binaries (download them, never commit)
+models/
+llama/
+*.gguf
+*.safetensors
+*.bin
+
+# generated per-PC config
+/opencode.json
+/.opencode/
+
+# runs, logs, memories
+runs/
+*.log
+proxy/memoria/*
+!proxy/memoria/.gitkeep
+extras/memoria/*
+!extras/memoria/.gitkeep
+skill_adattate/
+
+# Python / Node / OS
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+node_modules/
+.env
+.env.*
+Thumbs.db
+desktop.ini
