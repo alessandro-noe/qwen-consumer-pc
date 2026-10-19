@@ -13,6 +13,12 @@ Plus a small proxy that keeps "thinking" off until the model actually fails, whi
 | 5 hard multi-file coding tasks | **5/5**, mean **~28 min** with failure-triggered thinking vs **68 min** with thinking always on |
 | Cold start | ~40 s (the proxy starts the model on the first request and stops it after 30 idle minutes) |
 
+**Smaller GPU?** We simulated a weaker card by keeping only **6 GB** of weights on the GPU (same CPU and RAM):
+**~21–25 tok/s** with our optional [hybrid-MoE patch](llamacpp-patch) (fixed hot experts on GPU, the rest in RAM), up to
+**~29 tok/s** on new code with batch 2048 (19.8–20.8 without the patch). On such a setup the CPU is the bottleneck
+(~13–16 ms per token), not the GPU. Not measured: real 8/12 GB cards, slower CPUs or DDR4. **32 GB of RAM is still
+needed.** Details: [docs/it/INVENZIONI.md](docs/it/INVENZIONI.md) (Italian).
+
 The model is **not pruned**: all 512 experts per layer, top-10 routing, ~6B active parameters per token.
 Model weights are **not** in this repository; you download them from their authors (links below).
 
@@ -179,6 +185,9 @@ Results on other GPUs and RAM sizes are very welcome: open an issue with the out
   e la tabella da 28,8 GB resta sul disco e viene letta solo quando serve (`-lm mmap -lzm on`).
 - **Lo smistatore** (`proxy/smistatore.py`): il modello lavora *senza* ragionamento e lo accende solo dopo 2 errori **veri**
   (test falliti, codici d'uscita). Su 5 compiti difficili: 5/5 in ~28 minuti di media invece di 68. Risultato preliminare (pochi compiti).
+- **Scheda più piccola?** Simulando una scheda da **6 GB** (stesso processore e RAM): **~21–25 tok/s** con la nostra patch
+  facoltativa (MoE ibrido), fino a **~29** sul codice nuovo con il lotto 2048. Il limite diventa il processore. Non misurato:
+  schede vere da 8/12 GB, processori più lenti, DDR4. **Servono comunque 32 GB di RAM.**
 - **Misure oneste:** un solo PC, banchi piccoli, anche i risultati negativi. "Token al secondo" non è la velocità vera: conta il tempo per finire un compito.
 
 **Con Noè** (il mio agente, repository in arrivo): lo smistatore parla l'API OpenAI, quindi Noè lo usa direttamente e aggiunge regole nel codice ("fatto" solo con un test superato), revisore automatico, memoria che accetta solo lezioni verificate e, se vuoi, il controllo del PC con i tuoi permessi.
